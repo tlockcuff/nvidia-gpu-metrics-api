@@ -215,7 +215,15 @@ def _gather_metrics() -> GPUResponseModel:
                 except Exception:
                     fan_rpm = 0.0
 
-            status = "active" if gpu_util >= 10.0 or power_w > 20.0 else "idle"
+            # More nuanced status detection with lower thresholds and multiple indicators
+            is_active = (
+                gpu_util >= 5.0 or  # Lower GPU utilization threshold
+                power_w > 10.0 or   # Lower power threshold (some GPUs idle at ~15W)
+                mem_util >= 5.0 or  # Memory utilization indicates activity
+                gfx_clock > max_gfx_clock * 0.3 or  # Graphics clock above base/idle levels
+                temp_c > 40.0       # Temperature above typical idle (usually 30-35C)
+            )
+            status = "active" if is_active else "idle"
 
             gpus.append(
                 {
@@ -263,6 +271,14 @@ def _gather_metrics() -> GPUResponseModel:
                     },
                     "fan_speed_rpm": int(round(fan_rpm)),
                     "status": status,
+                    "debug_info": {
+                        "gpu_util_threshold": f"{gpu_util:.1f}% >= 5.0%",
+                        "power_threshold": f"{power_w:.1f}W > 10.0W",
+                        "memory_util_threshold": f"{mem_util:.1f}% >= 5.0%",
+                        "clock_threshold": f"{gfx_clock:.0f}MHz > {max_gfx_clock * 0.3:.0f}MHz",
+                        "temp_threshold": f"{temp_c:.1f}°C > 40.0°C",
+                        "is_active": is_active,
+                    },
                 }
             )
 

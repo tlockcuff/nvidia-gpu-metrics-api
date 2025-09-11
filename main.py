@@ -92,8 +92,13 @@ def _gather_metrics() -> GPUResponseModel:
 
     pynvml.nvmlInit()
     try:
-        driver_version = pynvml.nvmlSystemGetDriverVersion().decode()
-        nvml_version = pynvml.nvmlSystemGetNVMLVersion().decode()
+        # Handle both string and bytes return types for compatibility
+        driver_version_raw = pynvml.nvmlSystemGetDriverVersion()
+        driver_version = driver_version_raw.decode() if isinstance(driver_version_raw, bytes) else driver_version_raw
+        
+        nvml_version_raw = pynvml.nvmlSystemGetNVMLVersion()
+        nvml_version = nvml_version_raw.decode() if isinstance(nvml_version_raw, bytes) else nvml_version_raw
+        
         cuda_version = _get_cuda_version()
 
         device_count = pynvml.nvmlDeviceGetCount()
@@ -107,7 +112,8 @@ def _gather_metrics() -> GPUResponseModel:
 
         for i in range(device_count):
             handle = pynvml.nvmlDeviceGetHandleByIndex(i)
-            name = pynvml.nvmlDeviceGetName(handle).decode()
+            name_raw = pynvml.nvmlDeviceGetName(handle)
+            name = name_raw.decode() if isinstance(name_raw, bytes) else name_raw
 
             mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
             total_mb = mem.total / (1024 * 1024)

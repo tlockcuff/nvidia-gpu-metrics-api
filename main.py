@@ -246,10 +246,18 @@ def _get_disk_stats() -> Dict[str, Any]:
         # Get disk I/O counters (aggregated across all disks)
         io_counters = psutil.disk_io_counters()
         if io_counters:
-            total_read_bytes = io_counters.read_bytes
-            total_write_bytes = io_counters.write_bytes
-            total_read_count = io_counters.read_count
-            total_write_count = io_counters.write_count
+            # Handle None values that can occur on some systems (e.g., macOS)
+            # psutil may return None for read_bytes/read_count on some platforms
+            total_read_bytes = getattr(io_counters, 'read_bytes', None)
+            total_write_bytes = getattr(io_counters, 'write_bytes', None)
+            total_read_count = getattr(io_counters, 'read_count', None)
+            total_write_count = getattr(io_counters, 'write_count', None)
+            
+            # Convert None to 0 for calculations and display
+            total_read_bytes = total_read_bytes if total_read_bytes is not None else 0
+            total_write_bytes = total_write_bytes if total_write_bytes is not None else 0
+            total_read_count = total_read_count if total_read_count is not None else 0
+            total_write_count = total_write_count if total_write_count is not None else 0
             
             # Calculate rates using cached previous values
             read_bytes_per_sec = 0.0
@@ -263,10 +271,21 @@ def _get_disk_stats() -> Dict[str, Any]:
                 time_delta = current_time - prev_time
                 
                 if time_delta > 0:
-                    read_bytes_per_sec = (total_read_bytes - prev_read_bytes) / time_delta
-                    write_bytes_per_sec = (total_write_bytes - prev_write_bytes) / time_delta
-                    read_ops_per_sec = (total_read_count - prev_read_count) / time_delta
-                    write_ops_per_sec = (total_write_count - prev_write_count) / time_delta
+                    # Calculate rates - handle potential counter wraparound by checking for negative deltas
+                    read_bytes_delta = total_read_bytes - prev_read_bytes
+                    write_bytes_delta = total_write_bytes - prev_write_bytes
+                    read_count_delta = total_read_count - prev_read_count
+                    write_count_delta = total_write_count - prev_write_count
+                    
+                    # Only calculate positive rates (negative indicates counter reset/wraparound)
+                    if read_bytes_delta >= 0:
+                        read_bytes_per_sec = read_bytes_delta / time_delta
+                    if write_bytes_delta >= 0:
+                        write_bytes_per_sec = write_bytes_delta / time_delta
+                    if read_count_delta >= 0:
+                        read_ops_per_sec = read_count_delta / time_delta
+                    if write_count_delta >= 0:
+                        write_ops_per_sec = write_count_delta / time_delta
             
             # Update cache
             _disk_io_cache[cache_key] = (current_time, total_read_bytes, total_write_bytes, total_read_count, total_write_count)

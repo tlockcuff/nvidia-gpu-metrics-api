@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import platform
 import subprocess
 import time
 from typing import Any, Dict, List, Tuple
@@ -220,17 +221,45 @@ def _get_temperature_stats() -> Dict[str, Any]:
         }
 
 
+def _get_system_info() -> Dict[str, Any]:
+    """Gather system information like OS, architecture, hostname, etc."""
+    try:
+        return {
+            "os": platform.system(),
+            "os_release": platform.release(),
+            "os_version": platform.version(),
+            "architecture": platform.machine(),
+            "processor": platform.processor(),
+            "hostname": platform.node(),
+            "python_version": platform.python_version(),
+            "platform": platform.platform(),
+        }
+    except Exception:
+        return {
+            "os": "",
+            "os_release": "",
+            "os_version": "",
+            "architecture": "",
+            "processor": "",
+            "hostname": "",
+            "python_version": "",
+            "platform": "",
+        }
+
+
 def _gather_metrics() -> GPUResponseModel:
     # Gather system metrics (CPU, memory, disk, temperature)
     cpu_stats = _get_cpu_stats()
     memory_stats = _get_memory_stats()
     disk_stats = _get_disk_stats()
     temperature_stats = _get_temperature_stats()
+    system_info_data = _get_system_info()
     
     if pynvml is None:
         return GPUResponseModel(
             timestamp=_now_iso(),
             system_info={
+                **system_info_data,
                 "driver_version": "",
                 "cuda_version": "",
                 "nvml_version": "",
@@ -460,6 +489,7 @@ def _gather_metrics() -> GPUResponseModel:
         return GPUResponseModel(
             timestamp=_now_iso(),
             system_info={
+                **system_info_data,
                 "driver_version": driver_version,
                 "cuda_version": cuda_version,
                 "nvml_version": nvml_version,

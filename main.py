@@ -14,6 +14,11 @@ try:
 except Exception:  # pragma: no cover
     pynvml = None  # type: ignore
 
+try:
+    import psutil
+except Exception:  # pragma: no cover
+    psutil = None  # type: ignore
+
 
 class GPUResponseModel(BaseModel):
     timestamp: str
@@ -72,11 +77,207 @@ def _pcie_max_bandwidth_mbps(gen: int, width: int) -> float:
     return per_lane_MBps * float(width)
 
 
+def _get_cpu_stats() -> Dict[str, Any]:
+    """Gather CPU statistics."""
+    if psutil is None:
+        return {
+            "cpu_count_physical": 0,
+            "cpu_count_logical": 0,
+            "cpu_percent": 0.0,
+            "cpu_per_core_percent": [],
+            "cpu_freq_current_mhz": 0.0,
+            "cpu_freq_min_mhz": 0.0,
+            "cpu_freq_max_mhz": 0.0,
+        }
+    
+    try:
+        cpu_percent = psutil.cpu_percent(interval=0.1)
+        cpu_per_core = psutil.cpu_percent(interval=0.1, percpu=True)
+        cpu_freq = psutil.cpu_freq()
+        
+        return {
+            "cpu_count_physical": psutil.cpu_count(logical=False) or 0,
+            "cpu_count_logical": psutil.cpu_count(logical=True) or 0,
+            "cpu_percent": round(cpu_percent, 1),
+            "cpu_per_core_percent": [round(p, 1) for p in cpu_per_core],
+            "cpu_freq_current_mhz": round(cpu_freq.current, 1) if cpu_freq else 0.0,
+            "cpu_freq_min_mhz": round(cpu_freq.min, 1) if cpu_freq else 0.0,
+            "cpu_freq_max_mhz": round(cpu_freq.max, 1) if cpu_freq else 0.0,
+        }
+    except Exception:
+        return {
+            "cpu_count_physical": 0,
+            "cpu_count_logical": 0,
+            "cpu_percent": 0.0,
+            "cpu_per_core_percent": [],
+            "cpu_freq_current_mhz": 0.0,
+            "cpu_freq_min_mhz": 0.0,
+            "cpu_freq_max_mhz": 0.0,
+        }
+
+
+def _get_memory_stats() -> Dict[str, Any]:
+    """Gather system memory statistics."""
+    if psutil is None:
+        return {
+            "total_mb": 0,
+            "available_mb": 0,
+            "used_mb": 0,
+            "free_mb": 0,
+            "percent": 0.0,
+            "cached_mb": 0,
+            "buffers_mb": 0,
+        }
+    
+    try:
+        mem = psutil.virtual_memory()
+        return {
+            "total_mb": int(round(mem.total / (1024 * 1024))),
+            "available_mb": int(round(mem.available / (1024 * 1024))),
+            "used_mb": int(round(mem.used / (1024 * 1024))),
+            "free_mb": int(round(mem.free / (1024 * 1024))),
+            "percent": round(mem.percent, 1),
+            "cached_mb": int(round(getattr(mem, 'cached', 0) / (1024 * 1024))),
+            "buffers_mb": int(round(getattr(mem, 'buffers', 0) / (1024 * 1024))),
+        }
+    except Exception:
+        return {
+            "total_mb": 0,
+            "available_mb": 0,
+            "used_mb": 0,
+            "free_mb": 0,
+            "percent": 0.0,
+            "cached_mb": 0,
+            "buffers_mb": 0,
+        }
+
+
+def _get_disk_stats() -> List[Dict[str, Any]]:
+    """Gather disk/partition statistics."""
+    if psutil is None:
+        return []
+    
+    disks = []
+    per_disk_io = {}
+    
+    # Try to get per-disk IO counters
+    try:
+        io_counters = psutil.disk_io_counters(perdisk=True)
+        if io_counters:
+            per_disk_io = io_counters
+    except Exception:
+        # Fallback to system-wide IO counters
+        try:
+            io_counters = psutil.disk_io_counters(perdisk=False)
+            if io_counters:
+                per_disk_io = {"system": io_counters}
+        except Exception:
+            pass
+    
+    try:
+        partitions = psutil.disk_partitions()
+        for partition in partitions:
+            try:
+                usage = psutil.disk_usage(partition.mountpoint)
+                
+                disk_info = {
+                    "device": partition.device,
+                    "mountpoint": partition.mountpoint,
+                    "fstype": partition.fstype,
+                    "total_gb": round(usage.total / (1024 ** 3), 2),
+                    "used_gb": round(usage.used / (1024 ** 3), 2),
+                    "free_gb": round(usage.free / (1024 ** 3), 2),
+                    "percent": round(usage.percent, 1),
+                }
+                
+                # Try to match device with IO counters
+                # Extract device name (e.g., '/dev/sda1' -> 'sda')
+                device_name = partition.device.split('/')[-1] if partition.device else ""
+                # Remove partition number if present (e.g., 'sda1' -> 'sda')
+                if device_name and device_name[-1].isdigit():
+                    device_name = device_name.rstrip('0123456789')
+                
+                # Look for matching IO counter
+                io_data = None
+                for io_device, io_counter in per_disk_io.items():
+                    if device_name and device_name in io_device:
+                        io_data = io_counter
+                        break
+                
+                # If no match found, use system-wide if available
+                if not io_data and "system" in per_disk_io:
+                    io_data = per_disk_io["system"]
+                
+                if io_data:
+                    disk_info["io"] = {
+                        "read_bytes_mb": round(io_data.read_bytes / (1024 ** 2), 2),
+                        "write_bytes_mb": round(io_data.write_bytes / (1024 ** 2), 2),
+                        "read_count": io_data.read_count,
+                        "write_count": io_data.write_count,
+                    }
+                
+                disks.append(disk_info)
+            except (PermissionError, OSError):
+                # Skip partitions we can't access
+                continue
+    except Exception:
+        pass
+    
+    return disks
+
+
+def _get_temperature_stats() -> Dict[str, Any]:
+    """Gather system temperature statistics."""
+    if psutil is None:
+        return {
+            "temperatures": [],
+            "available": False,
+        }
+    
+    temps = []
+    try:
+        # psutil.sensors_temperatures() returns a dict of sensor labels to temperature readings
+        sensors = psutil.sensors_temperatures()
+        if sensors:
+            for sensor_name, sensor_readings in sensors.items():
+                for reading in sensor_readings:
+                    temps.append({
+                        "label": reading.label or sensor_name,
+                        "current_celsius": round(reading.current, 1),
+                        "high_celsius": round(reading.high, 1) if reading.high else None,
+                        "critical_celsius": round(reading.critical, 1) if reading.critical else None,
+                    })
+        
+        return {
+            "temperatures": temps,
+            "available": len(temps) > 0,
+        }
+    except Exception:
+        return {
+            "temperatures": [],
+            "available": False,
+        }
+
+
 def _gather_metrics() -> GPUResponseModel:
+    # Gather system metrics (CPU, memory, disk, temperature)
+    cpu_stats = _get_cpu_stats()
+    memory_stats = _get_memory_stats()
+    disk_stats = _get_disk_stats()
+    temperature_stats = _get_temperature_stats()
+    
     if pynvml is None:
         return GPUResponseModel(
             timestamp=_now_iso(),
-            system_info={"driver_version": "", "cuda_version": "", "nvml_version": ""},
+            system_info={
+                "driver_version": "",
+                "cuda_version": "",
+                "nvml_version": "",
+                "cpu": cpu_stats,
+                "memory": memory_stats,
+                "disks": disk_stats,
+                "temperature": temperature_stats,
+            },
             gpu_count=0,
             gpus=[],
             summary={
@@ -300,6 +501,10 @@ def _gather_metrics() -> GPUResponseModel:
                 "driver_version": driver_version,
                 "cuda_version": cuda_version,
                 "nvml_version": nvml_version,
+                "cpu": cpu_stats,
+                "memory": memory_stats,
+                "disks": disk_stats,
+                "temperature": temperature_stats,
             },
             gpu_count=device_count,
             gpus=gpus,

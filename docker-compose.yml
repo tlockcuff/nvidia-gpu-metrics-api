@@ -7,6 +7,13 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      # API Key for SSE streaming endpoint authentication
+      # Set API_KEY for single key, or API_KEYS for comma-separated multiple keys
+      # If not set, authentication is optional (backward compatible)
+      # - API_KEY=your-secret-api-key-here
+      # - API_KEYS=key1,key2,key3
+      # Optional: Set default stream interval (default: 2.0 seconds)
+      # - DEFAULT_STREAM_INTERVAL=2.0
     deploy:
       resources:
         reservations:

@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import platform
 import subprocess
 import time
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 try:
@@ -58,6 +61,35 @@ app.add_middleware(
 
 def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _get_valid_api_keys() -> List[str]:
+    """Get valid API keys from environment variables."""
+    api_keys = []
+    # Support single API_KEY
+    api_key = os.getenv("API_KEY")
+    if api_key:
+        api_keys.append(api_key)
+    # Support comma-separated API_KEYS
+    api_keys_env = os.getenv("API_KEYS")
+    if api_keys_env:
+        api_keys.extend([key.strip() for key in api_keys_env.split(",") if key.strip()])
+    return api_keys
+
+
+def _validate_api_key(api_key: Optional[str] = None, x_api_key: Optional[str] = None) -> bool:
+    """Validate API key from query parameter or header."""
+    valid_keys = _get_valid_api_keys()
+    # If no API keys are configured, allow access (backward compatibility)
+    if not valid_keys:
+        return True
+    
+    # Check query parameter first, then header
+    provided_key = api_key or x_api_key
+    if not provided_key:
+        return False
+    
+    return provided_key in valid_keys
 
 
 def _get_cuda_version() -> str:
@@ -171,17 +203,80 @@ def _get_memory_stats() -> Dict[str, Any]:
         }
 
 
+# Module-level storage for disk I/O rate calculation
+_disk_io_cache: Dict[str, Tuple[float, int, int, int, int]] = {}  # device -> (timestamp, read_bytes, write_bytes, read_count, write_count)
+
+
 def _get_disk_stats() -> Dict[str, Any]:
-    """Gather disk usage statistics - returns used and available space."""
+    """Gather disk usage statistics and I/O activity - returns used/available space and I/O metrics."""
     if psutil is None:
         return {
             "used_gb": 0.0,
             "available_gb": 0.0,
+            "io": {
+                "read_bytes_per_sec": 0.0,
+                "write_bytes_per_sec": 0.0,
+                "read_ops_per_sec": 0.0,
+                "write_ops_per_sec": 0.0,
+                "total_read_bytes": 0,
+                "total_write_bytes": 0,
+                "total_read_ops": 0,
+                "total_write_ops": 0,
+            }
         }
     
     total_used_gb = 0.0
     total_available_gb = 0.0
+    
+    # Disk I/O statistics
+    total_read_bytes = 0
+    total_write_bytes = 0
+    total_read_count = 0
+    total_write_count = 0
+    
+    # Initialize rate variables
+    read_bytes_per_sec = 0.0
+    write_bytes_per_sec = 0.0
+    read_ops_per_sec = 0.0
+    write_ops_per_sec = 0.0
+    
+    current_time = time.time()
+    
     try:
+        # Get disk I/O counters (aggregated across all disks)
+        io_counters = psutil.disk_io_counters()
+        if io_counters:
+            total_read_bytes = io_counters.read_bytes
+            total_write_bytes = io_counters.write_bytes
+            total_read_count = io_counters.read_count
+            total_write_count = io_counters.write_count
+            
+            # Calculate rates using cached previous values
+            read_bytes_per_sec = 0.0
+            write_bytes_per_sec = 0.0
+            read_ops_per_sec = 0.0
+            write_ops_per_sec = 0.0
+            
+            cache_key = "system"
+            if cache_key in _disk_io_cache:
+                prev_time, prev_read_bytes, prev_write_bytes, prev_read_count, prev_write_count = _disk_io_cache[cache_key]
+                time_delta = current_time - prev_time
+                
+                if time_delta > 0:
+                    read_bytes_per_sec = (total_read_bytes - prev_read_bytes) / time_delta
+                    write_bytes_per_sec = (total_write_bytes - prev_write_bytes) / time_delta
+                    read_ops_per_sec = (total_read_count - prev_read_count) / time_delta
+                    write_ops_per_sec = (total_write_count - prev_write_count) / time_delta
+            
+            # Update cache
+            _disk_io_cache[cache_key] = (current_time, total_read_bytes, total_write_bytes, total_read_count, total_write_count)
+        else:
+            read_bytes_per_sec = 0.0
+            write_bytes_per_sec = 0.0
+            read_ops_per_sec = 0.0
+            write_ops_per_sec = 0.0
+        
+        # Get disk usage statistics
         partitions = psutil.disk_partitions()
         seen_devices = set()
         
@@ -210,6 +305,16 @@ def _get_disk_stats() -> Dict[str, Any]:
     return {
         "used_gb": round(total_used_gb, 2),
         "available_gb": round(total_available_gb, 2),
+        "io": {
+            "read_bytes_per_sec": round(read_bytes_per_sec, 2),
+            "write_bytes_per_sec": round(write_bytes_per_sec, 2),
+            "read_ops_per_sec": round(read_ops_per_sec, 2),
+            "write_ops_per_sec": round(write_ops_per_sec, 2),
+            "total_read_bytes": total_read_bytes,
+            "total_write_bytes": total_write_bytes,
+            "total_read_ops": total_read_count,
+            "total_write_ops": total_write_count,
+        }
     }
 
 
@@ -475,6 +580,7 @@ def _gather_metrics() -> GPUResponseModel:
                 "memory": memory_stats,
                 "disk_used_gb": disk_stats["used_gb"],
                 "disk_available_gb": disk_stats["available_gb"],
+                "disk_io": disk_stats["io"],
                 "temperature_celsius": temperature_stats["temperature_celsius"],
             },
             gpu_count=0,
@@ -709,6 +815,7 @@ def _gather_metrics() -> GPUResponseModel:
                 "memory": memory_stats,
                 "disk_used_gb": disk_stats["used_gb"],
                 "disk_available_gb": disk_stats["available_gb"],
+                "disk_io": disk_stats["io"],
                 "temperature_celsius": temperature_stats["temperature_celsius"],
             },
             gpu_count=device_count,
@@ -738,5 +845,104 @@ def health() -> Dict[str, str]:
 @app.get("/gpu", response_model=GPUResponseModel)
 def get_gpu() -> GPUResponseModel:
     return _gather_metrics()
+
+
+async def _generate_sse_stream(interval: float):
+    """Generate SSE stream of GPU metrics."""
+    while True:
+        try:
+            # Gather metrics
+            metrics = _gather_metrics()
+            
+            # Convert to JSON
+            json_data = metrics.model_dump_json()
+            
+            # Format as SSE message
+            # SSE format: "data: {json}\n\n"
+            message = f"data: {json_data}\n\n"
+            
+            yield message
+            
+            # Wait for the specified interval
+            await asyncio.sleep(interval)
+            
+        except asyncio.CancelledError:
+            # Client disconnected, clean up
+            break
+        except Exception as e:
+            # Send error event and continue streaming
+            error_data = {
+                "error": str(e),
+                "timestamp": _now_iso(),
+                "status": "error"
+            }
+            error_message = f"data: {json.dumps(error_data)}\n\n"
+            yield error_message
+            # Wait before retrying
+            await asyncio.sleep(interval)
+
+
+@app.get("/gpu/stream")
+async def stream_gpu(
+    api_key: Optional[str] = Query(None, description="API key for authentication"),
+    interval: float = Query(2.0, ge=0.5, le=60.0, description="Update interval in seconds (0.5-60)"),
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key", description="API key in header")
+):
+    """
+    Stream GPU metrics in real-time using Server-Sent Events (SSE).
+    
+    This endpoint provides a continuous stream of GPU metrics, eliminating the need
+    for client-side polling. Metrics are sent at the specified interval.
+    
+    **Authentication:**
+    - Provide API key via query parameter: `?api_key=your_key`
+    - Or via header: `X-API-Key: your_key`
+    - If no API keys are configured in environment, authentication is optional
+    
+    **Parameters:**
+    - `interval`: Update frequency in seconds (default: 2.0, min: 0.5, max: 60.0)
+    - `api_key`: API key for authentication (query parameter)
+    
+    **Response:**
+    - Content-Type: `text/event-stream`
+    - Each message is a JSON object following the same structure as `/gpu` endpoint
+    - Messages are formatted as SSE events: `data: {json}\n\n`
+    
+    **Example Client (JavaScript):**
+    ```javascript
+    const eventSource = new EventSource('http://localhost:8008/gpu/stream?api_key=your_key&interval=1');
+    eventSource.onmessage = (event) => {
+        const metrics = JSON.parse(event.data);
+        console.log(metrics);
+    };
+    ```
+    """
+    # Validate API key
+    if not _validate_api_key(api_key, x_api_key):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing API key. Provide API key via 'api_key' query parameter or 'X-API-Key' header."
+        )
+    
+    # Use environment variable for default interval if available and user didn't specify custom interval
+    env_interval = os.getenv("DEFAULT_STREAM_INTERVAL")
+    if env_interval and interval == 2.0:  # Only override if using default value
+        try:
+            interval = float(env_interval)
+            # Ensure it's within valid range
+            interval = max(0.5, min(60.0, interval))
+        except (ValueError, TypeError):
+            pass  # Keep default interval if env var is invalid
+    
+    # Return SSE stream
+    return StreamingResponse(
+        _generate_sse_stream(interval),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Disable buffering in nginx
+        }
+    )
 
 

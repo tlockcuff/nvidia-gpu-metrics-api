@@ -21,6 +21,22 @@ except Exception:  # pragma: no cover
     psutil = None  # type: ignore
 
 
+# Docker Configuration Note:
+# This service is designed to run with docker-compose.yml configured with:
+#   - pid: "host" - Shares the host's PID namespace, allowing the container to see
+#                   all host processes. The container's /proc IS the host's /proc.
+#   - /proc:/host_proc:ro - Mounts host /proc as read-only (redundant with pid: host
+#                            but provides an alternative access path if needed)
+#
+# With pid: "host", psutil automatically sees all host processes without any special
+# configuration. Process PIDs from pynvml (GPU processes) are host PIDs, which
+# psutil can resolve directly since they share the same PID namespace.
+#
+# This enables:
+#   - Host process monitoring: _get_top_memory_processes() sees all host processes
+#   - GPU process resolution: _get_gpu_processes() resolves GPU PIDs to process names
+
+
 class GPUResponseModel(BaseModel):
     timestamp: str
     system_info: Dict[str, Any]
@@ -223,12 +239,32 @@ def _get_temperature_stats() -> Dict[str, Any]:
 
 
 def _get_top_memory_processes(limit: int = 5) -> List[Dict[str, Any]]:
-    """Get top N processes by memory consumption."""
+    """
+    Get top N processes by memory consumption on the host system.
+    
+    With docker-compose.yml configured with `pid: "host"`, the container shares
+    the host's PID namespace. This means psutil.process_iter() automatically sees
+    all host processes without any special configuration. The container's /proc
+    filesystem IS the host's /proc, so process information is directly accessible.
+    
+    Returns a list of dictionaries containing:
+    - pid: Process ID (host PID)
+    - name: Process name
+    - memory_mb: Resident Set Size (RSS) in MB
+    - username: Process owner username
+    
+    Args:
+        limit: Maximum number of processes to return (default: 5)
+        
+    Returns:
+        List of process dictionaries, sorted by memory usage (descending)
+    """
     if psutil is None:
         return []
     
     processes = []
     try:
+        # With pid: "host", this iterates over all host processes
         for proc in psutil.process_iter(['pid', 'name', 'memory_info', 'username']):
             try:
                 pinfo = proc.info
@@ -241,9 +277,14 @@ def _get_top_memory_processes(limit: int = 5) -> List[Dict[str, Any]]:
                         "username": pinfo.get('username', ''),
                     })
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                # Process disappeared, permission denied, or is a zombie - skip it
+                continue
+            except Exception:
+                # Unexpected error for this process - skip and continue
                 continue
     except Exception:
-        pass
+        # If process_iter() itself fails, return empty list
+        return []
     
     # Sort by memory usage (descending) and return top N
     processes.sort(key=lambda x: x['memory_mb'], reverse=True)
@@ -251,18 +292,44 @@ def _get_top_memory_processes(limit: int = 5) -> List[Dict[str, Any]]:
 
 
 def _get_gpu_processes(handle: Any, limit: int = 5) -> List[Dict[str, Any]]:
-    """Get top N processes using GPU memory for a specific GPU."""
+    """
+    Get top N processes using GPU memory for a specific GPU device.
+    
+    This function queries NVML for processes using the GPU, then resolves process
+    names and usernames using psutil. With docker-compose.yml configured with
+    `pid: "host"`, the PIDs returned by pynvml are host PIDs, which psutil can
+    resolve directly since it shares the same PID namespace.
+    
+    Process resolution flow:
+    1. pynvml returns host PIDs from GPU processes
+    2. psutil.Process(pid) resolves these PIDs to process names/usernames
+    3. Both operate in the same PID namespace (host), so resolution is seamless
+    
+    Returns a list of dictionaries containing:
+    - pid: Process ID (host PID from pynvml)
+    - name: Process name (resolved via psutil)
+    - memory_mb: GPU memory usage in MB
+    - username: Process owner username (resolved via psutil)
+    
+    Args:
+        handle: NVML device handle for the GPU
+        limit: Maximum number of processes to return (default: 5)
+        
+    Returns:
+        List of GPU process dictionaries, sorted by GPU memory usage (descending)
+    """
     if pynvml is None:
         return []
     
     processes = []
     try:
-        # Try to get compute processes
+        # Try to get compute processes (CUDA compute workloads)
         try:
             compute_procs = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
             for proc in compute_procs:
                 try:
-                    # Get process name using psutil if available
+                    # Get process name and username using psutil
+                    # With pid: "host", proc.pid is a host PID, so psutil resolves it directly
                     proc_name = ""
                     username = ""
                     if psutil:
@@ -270,7 +337,15 @@ def _get_gpu_processes(handle: Any, limit: int = 5) -> List[Dict[str, Any]]:
                             p = psutil.Process(proc.pid)
                             proc_name = p.name()
                             username = p.username()
-                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        except psutil.NoSuchProcess:
+                            # Process disappeared between pynvml query and psutil lookup
+                            # This can happen due to race conditions - continue with PID only
+                            pass
+                        except psutil.AccessDenied:
+                            # Permission denied - continue without name/username
+                            pass
+                        except psutil.ZombieProcess:
+                            # Process is a zombie - continue without name/username
                             pass
                     
                     processes.append({
@@ -280,19 +355,22 @@ def _get_gpu_processes(handle: Any, limit: int = 5) -> List[Dict[str, Any]]:
                         "username": username,
                     })
                 except Exception:
+                    # Unexpected error for this process - skip and continue
                     continue
         except pynvml.NVMLError:
+            # GPU doesn't support compute process queries or error occurred
             pass
         
-        # Try to get graphics processes
+        # Try to get graphics processes (OpenGL/Vulkan graphics workloads)
         try:
             graphics_procs = pynvml.nvmlDeviceGetGraphicsRunningProcesses(handle)
             for proc in graphics_procs:
                 try:
                     # Check if we already have this PID from compute processes
+                    # (a process can appear in both lists)
                     existing_pid = any(p['pid'] == proc.pid for p in processes)
                     if not existing_pid:
-                        # Get process name using psutil if available
+                        # Get process name and username using psutil
                         proc_name = ""
                         username = ""
                         if psutil:
@@ -300,7 +378,14 @@ def _get_gpu_processes(handle: Any, limit: int = 5) -> List[Dict[str, Any]]:
                                 p = psutil.Process(proc.pid)
                                 proc_name = p.name()
                                 username = p.username()
-                            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            except psutil.NoSuchProcess:
+                                # Process disappeared between pynvml query and psutil lookup
+                                pass
+                            except psutil.AccessDenied:
+                                # Permission denied - continue without name/username
+                                pass
+                            except psutil.ZombieProcess:
+                                # Process is a zombie - continue without name/username
                                 pass
                         
                         processes.append({
@@ -310,14 +395,17 @@ def _get_gpu_processes(handle: Any, limit: int = 5) -> List[Dict[str, Any]]:
                             "username": username,
                         })
                 except Exception:
+                    # Unexpected error for this process - skip and continue
                     continue
         except pynvml.NVMLError:
+            # GPU doesn't support graphics process queries or error occurred
             pass
         
-        # Sort by memory usage (descending) and return top N
+        # Sort by GPU memory usage (descending) and return top N
         processes.sort(key=lambda x: x['memory_mb'], reverse=True)
         return processes[:limit]
     except Exception:
+        # If anything unexpected happens, return empty list
         return []
 
 

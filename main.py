@@ -127,10 +127,12 @@ def _get_memory_stats() -> Dict[str, Any]:
             "percent": 0.0,
             "cached_mb": 0,
             "buffers_mb": 0,
+            "top_processes": [],
         }
     
     try:
         mem = psutil.virtual_memory()
+        top_processes = _get_top_memory_processes(limit=5)
         return {
             "total_mb": int(round(mem.total / (1024 * 1024))),
             "available_mb": int(round(mem.available / (1024 * 1024))),
@@ -138,6 +140,7 @@ def _get_memory_stats() -> Dict[str, Any]:
             "percent": round(mem.percent, 1),
             "cached_mb": int(round(getattr(mem, 'cached', 0) / (1024 * 1024))),
             "buffers_mb": int(round(getattr(mem, 'buffers', 0) / (1024 * 1024))),
+            "top_processes": top_processes,
         }
     except Exception:
         return {
@@ -147,6 +150,7 @@ def _get_memory_stats() -> Dict[str, Any]:
             "percent": 0.0,
             "cached_mb": 0,
             "buffers_mb": 0,
+            "top_processes": [],
         }
 
 
@@ -216,6 +220,105 @@ def _get_temperature_stats() -> Dict[str, Any]:
         return {
             "temperature_celsius": 0.0,
         }
+
+
+def _get_top_memory_processes(limit: int = 5) -> List[Dict[str, Any]]:
+    """Get top N processes by memory consumption."""
+    if psutil is None:
+        return []
+    
+    processes = []
+    try:
+        for proc in psutil.process_iter(['pid', 'name', 'memory_info', 'username']):
+            try:
+                pinfo = proc.info
+                mem_info = pinfo.get('memory_info')
+                if mem_info:
+                    processes.append({
+                        "pid": pinfo['pid'],
+                        "name": pinfo.get('name', ''),
+                        "memory_mb": round(mem_info.rss / (1024 * 1024), 1),
+                        "username": pinfo.get('username', ''),
+                    })
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+    except Exception:
+        pass
+    
+    # Sort by memory usage (descending) and return top N
+    processes.sort(key=lambda x: x['memory_mb'], reverse=True)
+    return processes[:limit]
+
+
+def _get_gpu_processes(handle: Any, limit: int = 5) -> List[Dict[str, Any]]:
+    """Get top N processes using GPU memory for a specific GPU."""
+    if pynvml is None:
+        return []
+    
+    processes = []
+    try:
+        # Try to get compute processes
+        try:
+            compute_procs = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
+            for proc in compute_procs:
+                try:
+                    # Get process name using psutil if available
+                    proc_name = ""
+                    username = ""
+                    if psutil:
+                        try:
+                            p = psutil.Process(proc.pid)
+                            proc_name = p.name()
+                            username = p.username()
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            pass
+                    
+                    processes.append({
+                        "pid": proc.pid,
+                        "name": proc_name,
+                        "memory_mb": round(proc.usedGpuMemory / (1024 * 1024), 1),
+                        "username": username,
+                    })
+                except Exception:
+                    continue
+        except pynvml.NVMLError:
+            pass
+        
+        # Try to get graphics processes
+        try:
+            graphics_procs = pynvml.nvmlDeviceGetGraphicsRunningProcesses(handle)
+            for proc in graphics_procs:
+                try:
+                    # Check if we already have this PID from compute processes
+                    existing_pid = any(p['pid'] == proc.pid for p in processes)
+                    if not existing_pid:
+                        # Get process name using psutil if available
+                        proc_name = ""
+                        username = ""
+                        if psutil:
+                            try:
+                                p = psutil.Process(proc.pid)
+                                proc_name = p.name()
+                                username = p.username()
+                            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                                pass
+                        
+                        processes.append({
+                            "pid": proc.pid,
+                            "name": proc_name,
+                            "memory_mb": round(proc.usedGpuMemory / (1024 * 1024), 1),
+                            "username": username,
+                        })
+                except Exception:
+                    continue
+        except pynvml.NVMLError:
+            pass
+        
+        # Sort by memory usage (descending) and return top N
+        processes.sort(key=lambda x: x['memory_mb'], reverse=True)
+        return processes[:limit]
+    except Exception:
+        return []
 
 
 def _get_system_info() -> Dict[str, Any]:
@@ -414,6 +517,9 @@ def _gather_metrics() -> GPUResponseModel:
             )
             status = "active" if is_active else "idle"
 
+            # Get top GPU processes
+            gpu_processes = _get_gpu_processes(handle, limit=5)
+
             gpus.append(
                 {
                     "id": i,
@@ -460,6 +566,7 @@ def _gather_metrics() -> GPUResponseModel:
                     },
                     "fan_speed_rpm": int(round(fan_rpm)),
                     "status": status,
+                    "top_processes": gpu_processes,
                     "debug_info": {
                         "gpu_util_threshold": f"{gpu_util:.1f}% >= 5.0%",
                         "power_threshold": f"{power_w:.1f}W > 10.0W",

@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
 try:
@@ -205,6 +205,10 @@ def _get_memory_stats() -> Dict[str, Any]:
 
 # Module-level storage for disk I/O rate calculation
 _disk_io_cache: Dict[str, Tuple[float, int, int, int, int]] = {}  # device -> (timestamp, read_bytes, write_bytes, read_count, write_count)
+
+# Module-level storage for GPU peak values and rate calculations
+_gpu_peak_cache: Dict[int, Dict[str, float]] = {}  # gpu_id -> {metric_name: peak_value}
+_gpu_rate_cache: Dict[int, Tuple[float, float, float]] = {}  # gpu_id -> (timestamp, prev_temp, prev_power)
 
 
 def _get_disk_stats() -> Dict[str, Any]:
@@ -443,6 +447,7 @@ def _get_gpu_processes(handle: Any, limit: int = 5, total_gpu_memory_mb: float =
     - memory_mb: GPU memory usage in MB
     - memory_percent: Percentage of total GPU memory used by this process
     - username: Process owner username (resolved via psutil)
+    - cpu_percent: CPU usage percentage for this process
     
     Args:
         handle: NVML device handle for the GPU
@@ -462,15 +467,18 @@ def _get_gpu_processes(handle: Any, limit: int = 5, total_gpu_memory_mb: float =
             compute_procs = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
             for proc in compute_procs:
                 try:
-                    # Get process name and username using psutil
+                    # Get process name, username, and CPU usage using psutil
                     # With pid: "host", proc.pid is a host PID, so psutil resolves it directly
                     proc_name = ""
                     username = ""
+                    cpu_percent = 0.0
                     if psutil:
                         try:
                             p = psutil.Process(proc.pid)
                             proc_name = p.name()
                             username = p.username()
+                            # Get CPU usage (non-blocking, uses cached value or 0.0)
+                            cpu_percent = p.cpu_percent(interval=None)
                         except psutil.NoSuchProcess:
                             # Process disappeared between pynvml query and psutil lookup
                             # This can happen due to race conditions - continue with PID only
@@ -492,6 +500,7 @@ def _get_gpu_processes(handle: Any, limit: int = 5, total_gpu_memory_mb: float =
                         "memory_mb": memory_mb,
                         "memory_percent": memory_percent,
                         "username": username,
+                        "cpu_percent": round(cpu_percent, 1),
                     })
                 except Exception:
                     # Unexpected error for this process - skip and continue
@@ -509,14 +518,17 @@ def _get_gpu_processes(handle: Any, limit: int = 5, total_gpu_memory_mb: float =
                     # (a process can appear in both lists)
                     existing_pid = any(p['pid'] == proc.pid for p in processes)
                     if not existing_pid:
-                        # Get process name and username using psutil
+                        # Get process name, username, and CPU usage using psutil
                         proc_name = ""
                         username = ""
+                        cpu_percent = 0.0
                         if psutil:
                             try:
                                 p = psutil.Process(proc.pid)
                                 proc_name = p.name()
                                 username = p.username()
+                                # Get CPU usage (non-blocking, uses cached value or 0.0)
+                                cpu_percent = p.cpu_percent(interval=None)
                             except psutil.NoSuchProcess:
                                 # Process disappeared between pynvml query and psutil lookup
                                 pass
@@ -537,6 +549,7 @@ def _get_gpu_processes(handle: Any, limit: int = 5, total_gpu_memory_mb: float =
                             "memory_mb": memory_mb,
                             "memory_percent": memory_percent,
                             "username": username,
+                            "cpu_percent": round(cpu_percent, 1),
                         })
                 except Exception:
                     # Unexpected error for this process - skip and continue
@@ -640,6 +653,19 @@ def _gather_metrics() -> GPUResponseModel:
             name_raw = pynvml.nvmlDeviceGetName(handle)
             name = name_raw.decode() if isinstance(name_raw, bytes) else name_raw
 
+            # Performance State (P-State)
+            try:
+                perf_state = int(pynvml.nvmlDeviceGetPerformanceState(handle))
+            except pynvml.NVMLError:
+                perf_state = -1  # Unknown/unsupported
+
+            # Compute Capability
+            try:
+                compute_major, compute_minor = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
+                compute_capability = f"{compute_major}.{compute_minor}"
+            except pynvml.NVMLError:
+                compute_capability = ""
+
             mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
             total_mb = mem.total / (1024 * 1024)
             used_mb = mem.used / (1024 * 1024)
@@ -665,6 +691,39 @@ def _gather_metrics() -> GPUResponseModel:
                 power_limit_mw = 0.0
                 power_limit_w = 0.0
             power_eff = (power_w / power_limit_w * 100.0) if power_limit_w > 0 else 0.0
+            power_budget_w = max(0.0, power_limit_w - power_w) if power_limit_w > 0 else 0.0
+
+            # Rate of change calculations and peak tracking
+            current_time = time.time()
+            temp_delta_per_sec = 0.0
+            power_delta_per_sec = 0.0
+            
+            if i in _gpu_rate_cache:
+                prev_time, prev_temp, prev_power = _gpu_rate_cache[i]
+                time_delta = current_time - prev_time
+                if time_delta > 0:
+                    temp_delta = temp_c - prev_temp
+                    power_delta = power_w - prev_power
+                    temp_delta_per_sec = temp_delta / time_delta
+                    power_delta_per_sec = power_delta / time_delta
+            
+            _gpu_rate_cache[i] = (current_time, temp_c, power_w)
+            
+            # Peak value tracking
+            if i not in _gpu_peak_cache:
+                _gpu_peak_cache[i] = {
+                    "gpu_utilization_percent": gpu_util,
+                    "power_watts": power_w,
+                    "temperature_celsius": temp_c,
+                }
+            else:
+                _gpu_peak_cache[i]["gpu_utilization_percent"] = max(_gpu_peak_cache[i]["gpu_utilization_percent"], gpu_util)
+                _gpu_peak_cache[i]["power_watts"] = max(_gpu_peak_cache[i]["power_watts"], power_w)
+                _gpu_peak_cache[i]["temperature_celsius"] = max(_gpu_peak_cache[i]["temperature_celsius"], temp_c)
+            
+            peak_gpu_util = _gpu_peak_cache[i]["gpu_utilization_percent"]
+            peak_power = _gpu_peak_cache[i]["power_watts"]
+            peak_temp = _gpu_peak_cache[i]["temperature_celsius"]
 
             # Clocks
             try:
@@ -758,6 +817,8 @@ def _gather_metrics() -> GPUResponseModel:
                     "id": i,
                     "timestamp": _now_iso(),
                     "name": name,
+                    "compute_capability": compute_capability,
+                    "performance_state": perf_state,
                     "memory": {
                         "total_mb": round(total_mb, 1),
                         "used_mb": round(used_mb, 1),
@@ -774,7 +835,17 @@ def _gather_metrics() -> GPUResponseModel:
                     "power": {
                         "usage_watts": round(power_w, 1),
                         "limit_watts": int(round(power_limit_mw)),  # UI divides by 1000
+                        "budget_watts": round(power_budget_w, 1),
                         "efficiency_percent": int(round(power_eff)),
+                    },
+                    "rate_of_change": {
+                        "temperature_delta_per_sec": round(temp_delta_per_sec, 2),
+                        "power_delta_per_sec": round(power_delta_per_sec, 2),
+                    },
+                    "peak_values": {
+                        "gpu_utilization_percent": round(peak_gpu_util, 1),
+                        "power_watts": round(peak_power, 1),
+                        "temperature_celsius": round(peak_temp, 1),
                     },
                     "clocks": {
                         "graphics_mhz": int(round(gfx_clock)),
@@ -856,9 +927,222 @@ def _gather_metrics() -> GPUResponseModel:
             pass
 
 
+def _generate_typescript_types() -> str:
+    """Generate TypeScript type definitions for the GPU metrics API response."""
+    return """// TypeScript type definitions for NVIDIA GPU Metrics API
+// Generated automatically - do not edit manually
+
+export interface GPUProcess {
+  pid: number;
+  name: string;
+  memory_mb: number;
+  memory_percent: number;
+  username: string;
+  cpu_percent: number;
+}
+
+export interface GPUMemory {
+  total_mb: number;
+  used_mb: number;
+  free_mb: number;
+  utilization_percent: number;
+  bandwidth_utilization_percent: number;
+}
+
+export interface GPUUtilization {
+  gpu_percent: number;
+  memory_percent: number;
+  sm_percent: number;
+}
+
+export interface GPUPower {
+  usage_watts: number;
+  limit_watts: number;
+  budget_watts: number;
+  efficiency_percent: number;
+}
+
+export interface GPURateOfChange {
+  temperature_delta_per_sec: number;
+  power_delta_per_sec: number;
+}
+
+export interface GPUPeakValues {
+  gpu_utilization_percent: number;
+  power_watts: number;
+  temperature_celsius: number;
+}
+
+export interface GPUClocks {
+  graphics_mhz: number;
+  memory_mhz: number;
+  max_graphics_mhz: number;
+  max_memory_mhz: number;
+  efficiency_percent: number;
+}
+
+export interface GPUPCIe {
+  generation: number;
+  width: number;
+  tx_throughput_mbps: number;
+  rx_throughput_mbps: number;
+  total_throughput_mbps: number;
+  max_bandwidth_mbps: number;
+  utilization_percent: number;
+}
+
+export interface GPUThrottling {
+  reasons: number;
+  is_throttled: boolean;
+  bottlenecks: string[];
+}
+
+export interface GPUDebugInfo {
+  gpu_util_threshold: string;
+  power_threshold: string;
+  memory_util_threshold: string;
+  clock_threshold: string;
+  temp_threshold: string;
+  is_active: boolean;
+}
+
+export interface GPU {
+  id: number;
+  timestamp: string;
+  name: string;
+  compute_capability: string;
+  performance_state: number;
+  memory: GPUMemory;
+  utilization: GPUUtilization;
+  temperature_celsius: number;
+  power: GPUPower;
+  rate_of_change: GPURateOfChange;
+  peak_values: GPUPeakValues;
+  clocks: GPUClocks;
+  pcie: GPUPCIe;
+  throttling: GPUThrottling;
+  fan_speed_rpm: number;
+  status: "active" | "idle";
+  top_processes: GPUProcess[];
+  debug_info: GPUDebugInfo;
+}
+
+export interface CPUStats {
+  cpu_count_physical: number;
+  cpu_count_logical: number;
+  cpu_percent: number;
+  cpu_per_core_percent: number[];
+  cpu_freq_current_mhz: number;
+  cpu_freq_min_mhz: number;
+  cpu_freq_max_mhz: number;
+}
+
+export interface MemoryStats {
+  total_mb: number;
+  available_mb: number;
+  used_mb: number;
+  percent: number;
+  cached_mb: number;
+  buffers_mb: number;
+  top_processes: Array<{
+    pid: number;
+    name: string;
+    memory_mb: number;
+    memory_percent: number;
+    username: string;
+  }>;
+}
+
+export interface DiskIO {
+  read_bytes_per_sec: number;
+  write_bytes_per_sec: number;
+  read_ops_per_sec: number;
+  write_ops_per_sec: number;
+  total_read_bytes: number;
+  total_write_bytes: number;
+  total_read_ops: number;
+  total_write_ops: number;
+}
+
+export interface SystemInfo {
+  os: string;
+  os_release: string;
+  os_version: string;
+  architecture: string;
+  processor: string;
+  hostname: string;
+  python_version: string;
+  platform: string;
+  driver_version: string;
+  cuda_version: string;
+  nvml_version: string;
+  cpu: CPUStats;
+  memory: MemoryStats;
+  disk_used_gb: number;
+  disk_available_gb: number;
+  disk_io: DiskIO;
+  temperature_celsius: number;
+}
+
+export interface GPUSummary {
+  total_memory_mb: number;
+  total_used_memory_mb: number;
+  memory_utilization_percent: number;
+  average_gpu_utilization_percent: number;
+  average_temperature_celsius: number;
+  total_power_usage_watts: number;
+}
+
+export interface GPUResponse {
+  timestamp: string;
+  system_info: SystemInfo;
+  gpu_count: number;
+  gpus: GPU[];
+  summary: GPUSummary;
+  status: "ok" | "error";
+}
+
+// Helper type for SSE stream events
+export interface GPUStreamEvent {
+  data: GPUResponse;
+  event?: string;
+  id?: string;
+}
+"""
+
+
 @app.get("/health")
 def health() -> Dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/types", response_class=Response)
+def get_typescript_types():
+    """
+    Returns TypeScript type definitions for the GPU metrics API response.
+    
+    This endpoint provides complete TypeScript type definitions that match
+    the structure of the `/gpu` endpoint response. Use these types in your
+    TypeScript/JavaScript projects for type safety and better IDE support.
+    
+    **Usage:**
+    ```typescript
+    // Download types
+    // curl http://localhost:8008/types > gpu-metrics-types.ts
+    
+    // Import in your code
+    import { GPUResponse, GPU } from './gpu-metrics-types';
+    
+    const response: GPUResponse = await fetch('/gpu').then(r => r.json());
+    ```
+    """
+    return Response(
+        content=_generate_typescript_types(),
+        media_type="application/typescript",
+        headers={
+            "Content-Disposition": 'attachment; filename="gpu-metrics-types.ts"',
+        },
+    )
 
 
 @app.get("/gpu", response_model=GPUResponseModel)

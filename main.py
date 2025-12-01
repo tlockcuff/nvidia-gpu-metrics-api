@@ -148,7 +148,8 @@ def _get_memory_stats() -> Dict[str, Any]:
     
     try:
         mem = psutil.virtual_memory()
-        top_processes = _get_top_memory_processes(limit=5)
+        total_memory_mb = mem.total / (1024 * 1024)
+        top_processes = _get_top_memory_processes(limit=5, total_memory_mb=total_memory_mb)
         return {
             "total_mb": int(round(mem.total / (1024 * 1024))),
             "available_mb": int(round(mem.available / (1024 * 1024))),
@@ -238,7 +239,7 @@ def _get_temperature_stats() -> Dict[str, Any]:
         }
 
 
-def _get_top_memory_processes(limit: int = 5) -> List[Dict[str, Any]]:
+def _get_top_memory_processes(limit: int = 5, total_memory_mb: float = 0.0) -> List[Dict[str, Any]]:
     """
     Get top N processes by memory consumption on the host system.
     
@@ -251,10 +252,12 @@ def _get_top_memory_processes(limit: int = 5) -> List[Dict[str, Any]]:
     - pid: Process ID (host PID)
     - name: Process name
     - memory_mb: Resident Set Size (RSS) in MB
+    - memory_percent: Percentage of total system memory used by this process
     - username: Process owner username
     
     Args:
         limit: Maximum number of processes to return (default: 5)
+        total_memory_mb: Total system memory in MB for percentage calculation (default: 0.0)
         
     Returns:
         List of process dictionaries, sorted by memory usage (descending)
@@ -270,10 +273,15 @@ def _get_top_memory_processes(limit: int = 5) -> List[Dict[str, Any]]:
                 pinfo = proc.info
                 mem_info = pinfo.get('memory_info')
                 if mem_info:
+                    memory_mb = round(mem_info.rss / (1024 * 1024), 1)
+                    # Calculate memory percentage if total memory is provided
+                    memory_percent = round((memory_mb / total_memory_mb * 100.0), 2) if total_memory_mb > 0 else 0.0
+                    
                     processes.append({
                         "pid": pinfo['pid'],
                         "name": pinfo.get('name', ''),
-                        "memory_mb": round(mem_info.rss / (1024 * 1024), 1),
+                        "memory_mb": memory_mb,
+                        "memory_percent": memory_percent,
                         "username": pinfo.get('username', ''),
                     })
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
@@ -291,7 +299,7 @@ def _get_top_memory_processes(limit: int = 5) -> List[Dict[str, Any]]:
     return processes[:limit]
 
 
-def _get_gpu_processes(handle: Any, limit: int = 5) -> List[Dict[str, Any]]:
+def _get_gpu_processes(handle: Any, limit: int = 5, total_gpu_memory_mb: float = 0.0) -> List[Dict[str, Any]]:
     """
     Get top N processes using GPU memory for a specific GPU device.
     
@@ -309,11 +317,13 @@ def _get_gpu_processes(handle: Any, limit: int = 5) -> List[Dict[str, Any]]:
     - pid: Process ID (host PID from pynvml)
     - name: Process name (resolved via psutil)
     - memory_mb: GPU memory usage in MB
+    - memory_percent: Percentage of total GPU memory used by this process
     - username: Process owner username (resolved via psutil)
     
     Args:
         handle: NVML device handle for the GPU
         limit: Maximum number of processes to return (default: 5)
+        total_gpu_memory_mb: Total GPU memory in MB for percentage calculation (default: 0.0)
         
     Returns:
         List of GPU process dictionaries, sorted by GPU memory usage (descending)
@@ -348,10 +358,15 @@ def _get_gpu_processes(handle: Any, limit: int = 5) -> List[Dict[str, Any]]:
                             # Process is a zombie - continue without name/username
                             pass
                     
+                    memory_mb = round(proc.usedGpuMemory / (1024 * 1024), 1)
+                    # Calculate GPU memory percentage if total GPU memory is provided
+                    memory_percent = round((memory_mb / total_gpu_memory_mb * 100.0), 2) if total_gpu_memory_mb > 0 else 0.0
+                    
                     processes.append({
                         "pid": proc.pid,
                         "name": proc_name,
-                        "memory_mb": round(proc.usedGpuMemory / (1024 * 1024), 1),
+                        "memory_mb": memory_mb,
+                        "memory_percent": memory_percent,
                         "username": username,
                     })
                 except Exception:
@@ -388,10 +403,15 @@ def _get_gpu_processes(handle: Any, limit: int = 5) -> List[Dict[str, Any]]:
                                 # Process is a zombie - continue without name/username
                                 pass
                         
+                        memory_mb = round(proc.usedGpuMemory / (1024 * 1024), 1)
+                        # Calculate GPU memory percentage if total GPU memory is provided
+                        memory_percent = round((memory_mb / total_gpu_memory_mb * 100.0), 2) if total_gpu_memory_mb > 0 else 0.0
+                        
                         processes.append({
                             "pid": proc.pid,
                             "name": proc_name,
-                            "memory_mb": round(proc.usedGpuMemory / (1024 * 1024), 1),
+                            "memory_mb": memory_mb,
+                            "memory_percent": memory_percent,
                             "username": username,
                         })
                 except Exception:
@@ -606,7 +626,7 @@ def _gather_metrics() -> GPUResponseModel:
             status = "active" if is_active else "idle"
 
             # Get top GPU processes
-            gpu_processes = _get_gpu_processes(handle, limit=5)
+            gpu_processes = _get_gpu_processes(handle, limit=5, total_gpu_memory_mb=total_mb)
 
             gpus.append(
                 {

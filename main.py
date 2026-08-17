@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import atexit
 import asyncio
 import json
 import os
 import platform
 import subprocess
+import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -592,7 +594,94 @@ def _get_system_info() -> Dict[str, Any]:
         }
 
 
-def _gather_metrics() -> GPUResponseModel:
+_nvml_lock = threading.Lock()
+_nvml_ready = False
+
+
+def _ensure_nvml() -> None:
+    """Initialize NVML once per process (thread-safe).
+
+    nvmlInit is refcounted, but calling init/shutdown on every request from
+    multiple worker threads can leave the driver library in a bad state
+    (NVMLError_Unknown). Initialize once and keep it alive for the process
+    lifetime.
+    """
+    global _nvml_ready
+    if pynvml is None:
+        raise RuntimeError("pynvml is not available")
+    if _nvml_ready:
+        return
+    with _nvml_lock:
+        if not _nvml_ready:
+            pynvml.nvmlInit()
+            _nvml_ready = True
+
+
+def _reset_nvml() -> None:
+    """Tear down and re-initialize NVML.
+
+    Recovery path for NVMLError_Unknown, which typically happens when the host
+    NVIDIA driver is reloaded/updated while this process is running.
+    """
+    global _nvml_ready
+    if pynvml is None:
+        raise RuntimeError("pynvml is not available")
+    with _nvml_lock:
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
+        _nvml_ready = False
+        pynvml.nvmlInit()
+        _nvml_ready = True
+
+
+@atexit.register
+def _shutdown_nvml() -> None:
+    if pynvml is not None and _nvml_ready:
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
+
+
+def _gpu_error_response(
+    cpu_stats: Dict[str, Any],
+    memory_stats: Dict[str, Any],
+    disk_stats: Dict[str, Any],
+    temperature_stats: Dict[str, Any],
+    system_info_data: Dict[str, Any],
+) -> GPUResponseModel:
+    """Response returned when GPU metrics are unavailable (keeps schema, no 500)."""
+    return GPUResponseModel(
+        timestamp=_now_iso(),
+        system_info={
+            **system_info_data,
+            "driver_version": "",
+            "cuda_version": "",
+            "nvml_version": "",
+            "cpu": cpu_stats,
+            "memory": memory_stats,
+            "disk_used_gb": disk_stats["used_gb"],
+            "disk_available_gb": disk_stats["available_gb"],
+            "disk_io": disk_stats["io"],
+            "temperature_celsius": temperature_stats["temperature_celsius"],
+        },
+        gpu_count=0,
+        gpus=[],
+        summary={
+            "total_memory_mb": 0,
+            "total_used_memory_mb": 0,
+            "memory_utilization_percent": 0,
+            "average_gpu_utilization_percent": 0,
+            "average_temperature_celsius": 0,
+            "total_power_usage_watts": 0,
+        },
+        status="error",
+    )
+
+
+def _gather_metrics(_allow_nvml_retry: bool = True) -> GPUResponseModel:
     # Gather system metrics (CPU, memory, disk, temperature)
     cpu_stats = _get_cpu_stats()
     memory_stats = _get_memory_stats()
@@ -601,34 +690,22 @@ def _gather_metrics() -> GPUResponseModel:
     system_info_data = _get_system_info()
     
     if pynvml is None:
-        return GPUResponseModel(
-            timestamp=_now_iso(),
-            system_info={
-                **system_info_data,
-                "driver_version": "",
-                "cuda_version": "",
-                "nvml_version": "",
-                "cpu": cpu_stats,
-                "memory": memory_stats,
-                "disk_used_gb": disk_stats["used_gb"],
-                "disk_available_gb": disk_stats["available_gb"],
-                "disk_io": disk_stats["io"],
-                "temperature_celsius": temperature_stats["temperature_celsius"],
-            },
-            gpu_count=0,
-            gpus=[],
-            summary={
-                "total_memory_mb": 0,
-                "total_used_memory_mb": 0,
-                "memory_utilization_percent": 0,
-                "average_gpu_utilization_percent": 0,
-                "average_temperature_celsius": 0,
-                "total_power_usage_watts": 0,
-            },
-            status="error",
+        return _gpu_error_response(
+            cpu_stats, memory_stats, disk_stats, temperature_stats, system_info_data
         )
 
-    pynvml.nvmlInit()
+    try:
+        _ensure_nvml()
+    except Exception:
+        # Init can fail with NVMLError_Unknown after a host driver reload;
+        # try one shutdown+init cycle before giving up on this request.
+        try:
+            _reset_nvml()
+        except Exception:
+            return _gpu_error_response(
+                cpu_stats, memory_stats, disk_stats, temperature_stats, system_info_data
+            )
+
     try:
         # Handle both string and bytes return types for compatibility
         driver_version_raw = pynvml.nvmlSystemGetDriverVersion()
@@ -920,11 +997,21 @@ def _gather_metrics() -> GPUResponseModel:
             },
             status="ok",
         )
-    finally:
-        try:
-            pynvml.nvmlShutdown()
-        except Exception:
-            pass
+    except pynvml.NVMLError:
+        # NVML can get stuck mid-process (typically the host driver was
+        # reloaded/updated while the container kept running). Reset NVML once
+        # and retry; if it still fails, degrade gracefully instead of a 500.
+        if _allow_nvml_retry:
+            try:
+                _reset_nvml()
+            except Exception:
+                return _gpu_error_response(
+                    cpu_stats, memory_stats, disk_stats, temperature_stats, system_info_data
+                )
+            return _gather_metrics(_allow_nvml_retry=False)
+        return _gpu_error_response(
+            cpu_stats, memory_stats, disk_stats, temperature_stats, system_info_data
+        )
 
 
 def _generate_typescript_types() -> str:
@@ -1247,5 +1334,3 @@ async def stream_gpu(
             "X-Accel-Buffering": "no",  # Disable buffering in nginx
         }
     )
-
-
